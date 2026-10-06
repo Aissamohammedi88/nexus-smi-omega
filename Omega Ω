@@ -1,0 +1,1313 @@
+#!/usr/bin/env bash# ═══════════════════════════════════════════════════════════════════════════════
+#
+# ⚡ NEXUS SMI OMEGA — v2.0.0
+# ─────────────────────────────────────────────────────────────────────────
+# Alternative complète à nvidia-smi. Sans NVIDIA.
+# Multi-vendor. Multi-langage. 10 configurations + 4 tests réels.
+#
+# Langages : Bash · Python · C++ · Rust · JAX · CUDA (optionnel)
+#
+# Auteur : Aissa Mohammedi (DGK)
+# Date : 2026.10.06
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+set -o pipefail
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+readonly VERSION="2.0.0"
+readonly BUILD_DATE="2026.10.06"
+readonly AUTHOR="Aissa Mohammedi (DGK)"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly ROOT="${SCRIPT_DIR}/nexus_smi"
+readonly LOGS="${ROOT}/logs"
+readonly BUILD="${ROOT}/build"
+readonly SRC="${ROOT}/src"
+readonly DATA="${ROOT}/data"
+readonly CACHE="${ROOT}/cache"
+readonly CONF="${ROOT}/configs"
+readonly TESTS="${ROOT}/tests"
+
+# Couleurs
+readonly C_RESET='\033[0m'
+readonly C_BOLD='\033[1m'
+readonly C_DIM='\033[2m'
+readonly C_RED='\033[91m'
+readonly C_GREEN='\033[92m'
+readonly C_YELLOW='\033[93m'
+readonly C_BLUE='\033[94m'
+readonly C_MAGENTA='\033[95m'
+readonly C_CYAN='\033[96m'
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INIT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+init() {
+mkdir -p "$LOGS" "$BUILD" "$SRC" "$DATA" "$CACHE" "$CONF" "$TESTS" 2>/dev/null
+touch "$LOGS/smi.log"
+}
+
+log() {
+local lvl="$1"; shift
+local msg="$*"
+local ts
+ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+echo "[$ts] [$lvl] $msg" >> "$LOGS/smi.log"
+case "$lvl" in
+INFO) echo -e "${C_BLUE}[i]${C_RESET} $msg" ;;
+OK) echo -e "${C_GREEN}[OK]${C_RESET} $msg" ;;
+WARN) echo -e "${C_YELLOW}[!!]${C_RESET} $msg" ;;
+ERROR) echo -e "${C_RED}[KO]${C_RESET} $msg" ;;
+DEBUG) echo -e "${C_DIM}[..]${C_RESET} $msg" ;;
+TEST) echo -e "${C_MAGENTA}[🧪]${C_RESET} $msg" ;;
+esac
+}
+
+section() {
+echo ""
+echo -e "${C_CYAN}═══════════════════════════════════════════════════════════════════${C_RESET}"
+echo -e "${C_CYAN} $*${C_RESET}"
+echo -e "${C_CYAN}═══════════════════════════════════════════════════════════════════${C_RESET}"
+echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# [1] SOURCES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+write_jax_analyzer() {
+local file="$SRC/jax_analyzer.py"
+cat > "$file" << 'PYEOF'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Nexus SMI — JAX Analyzer (CORRIGÉ)
+Analyse matricielle rapide des métriques système.
+Fallback numpy si JAX absent.
+"""
+import json
+import sys
+import math
+from pathlib import Path
+
+JAX_AVAILABLE = False
+NUMPY_AVAILABLE = False
+jnp = None
+
+# Try JAX first
+try:
+import jax
+import jax.numpy as jnp
+JAX_AVAILABLE = True
+except ImportError:
+pass
+
+# Fallback numpy
+if not JAX_AVAILABLE:
+try:
+import numpy
+jnp = numpy
+NUMPY_AVAILABLE = True
+except ImportError:
+pass
+
+
+class JAXSystemAnalyzer:
+"""Analyse les métriques système avec JAX ou numpy."""
+
+def __init__(self):
+self.available = JAX_AVAILABLE or NUMPY_AVAILABLE
+
+def analyze(self, metrics):
+if not self.available:
+return {
+"error": "JAX et numpy absents",
+"recommendation": "pip install jax jaxlib OU pip install numpy",
+"cpu_load": metrics.get("cpu_usage_percent", 0),
+"mem_usage": metrics.get("mem_usage_percent", 0),
+"gpu_count": metrics.get("gpu_count", 0),
+}
+
+results = {}
+
+cpu_load = float(metrics.get("cpu_usage_percent", 0))
+mem_usage = float(metrics.get("mem_usage_percent", 0))
+gpu_count = float(metrics.get("gpu_count", 0))
+
+state = jnp.array([cpu_load, mem_usage, gpu_count])
+
+# Norme L2
+norm = float(jnp.linalg.norm(state))
+results["state_norm"] = round(norm, 4)
+
+# Entropie normalisée
+total = float(jnp.sum(state))
+if total > 0:
+probs = state / total
+entropy = -float(jnp.sum(probs * jnp.log(probs + 1e-10)))
+results["entropy"] = round(entropy, 4)
+else:
+results["entropy"] = 0.0
+
+# Balanced ?
+results["balanced"] = cpu_load < 70 and mem_usage < 80
+
+# Health score (0-100)
+score = 100 - (cpu_load * 0.4 + mem_usage * 0.4 + min(100, gpu_count * 10) * 0.2)
+results["health_score"] = round(max(0, score), 2)
+
+# Version info
+if JAX_AVAILABLE:
+results["backend"] = f"JAX {jax.__version__}"
+elif NUMPY_AVAILABLE:
+results["backend"] = f"numpy {numpy.__version__}"
+else:
+results["backend"] = "unavailable"
+
+return results
+
+
+def main():
+smi_file = Path(__file__).parent.parent / "data" / "smi.json"
+if not smi_file.exists():
+print(json.dumps({"error": "smi.json absent. Lance collecte d'abord."}, indent=2))
+return
+
+try:
+data = json.loads(smi_file.read_text())
+except Exception as e:
+print(json.dumps({"error": f"Lecture: {e}"}, indent=2))
+return
+
+metrics = {
+"cpu_usage_percent": data.get("cpu", {}).get("usage_percent", 0),
+"mem_usage_percent": data.get("memory", {}).get("usage_percent", 0),
+"gpu_count": len(data.get("gpu", [])),
+}
+
+analyzer = JAXSystemAnalyzer()
+results = analyzer.analyze(metrics)
+print(json.dumps(results, indent=2))
+
+
+if __name__ == "__main__":
+main()
+PYEOF
+log OK " → jax_analyzer.py (CORRIGÉ)"
+}
+
+write_python_smi_core() {
+local file="$SRC/smi_core.py"
+cat > "$file" << 'PYEOF'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Nexus SMI — Core Python."""
+import os, sys, json, re, subprocess, platform, time
+from pathlib import Path
+from datetime import datetime
+
+class SMI:
+def __init__(self):
+self.data = {
+"timestamp": datetime.utcnow().isoformat() + "Z",
+"host": platform.node(),
+"system": {},
+"cpu": {},
+"gpu": [],
+"memory": {},
+"disks": [],
+"disk_usage": [],
+"network": [],
+"thermal": {"zones": [], "hwmon": []},
+"power": {},
+"pci": [],
+"usb": [],
+}
+
+def _read(self, path):
+try:
+return Path(path).read_text().strip()
+except Exception:
+return None
+
+def _run(self, cmd):
+try:
+r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+return r.stdout.strip()
+except Exception:
+return ""
+
+def collect_system(self):
+self.data["system"] = {
+"os": platform.system(),
+"release": platform.release(),
+"machine": platform.machine(),
+"uptime": self._read("/proc/uptime"),
+}
+
+def collect_cpu(self):
+cpu = {"info": {}}
+cpuinfo = self._read("/proc/cpuinfo")
+if cpuinfo:
+for line in cpuinfo.split("\n"):
+if "model name" in line:
+cpu["info"]["model"] = line.split(":")[1].strip()
+break
+cpu["info"]["cores"] = cpuinfo.count("processor\t:")
+freq_dir = Path("/sys/devices/system/cpu/cpu0/cpufreq")
+if freq_dir.exists():
+cpu["freq"] = {
+"current": self._read(str(freq_dir / "scaling_cur_freq")),
+"min": self._read(str(freq_dir / "scaling_min_freq")),
+"max": self._read(str(freq_dir / "scaling_max_freq")),
+"governor": self._read(str(freq_dir / "scaling_governor")),
+}
+cpu["loadavg"] = self._read("/proc/loadavg")
+stat = self._read("/proc/stat")
+if stat:
+for line in stat.split("\n"):
+if line.startswith("cpu "):
+parts = line.split()
+total = sum(int(x) for x in parts[1:])
+idle = int(parts[4])
+cpu["usage_percent"] = round((1 - idle / total) * 100, 2) if total else 0
+break
+self.data["cpu"] = cpu
+
+def collect_gpu(self):
+gpus = []
+for dri in Path("/sys/class/drm").glob("card*"):
+if "-" in dri.name:
+continue
+gpu = {"name": dri.name}
+device_path = dri / "device"
+if device_path.exists():
+vendor_id = self._read(str(device_path / "vendor"))
+vendors = {
+"0x10de": "NVIDIA", "0x1002": "AMD/ATI",
+"0x8086": "Intel", "0x1af4": "Virtio",
+}
+gpu["vendor_id"] = vendor_id
+gpu["vendor"] = vendors.get(vendor_id, "Unknown")
+mem_total = self._read(str(device_path / "mem_info_vram_total"))
+if mem_total:
+try:
+gpu["vram_total_gb"] = round(int(mem_total) / (1024**3), 2)
+except Exception:
+pass
+for hwmon in device_path.glob("hwmon/hwmon*"):
+temp = self._read(str(hwmon / "temp1_input"))
+if temp:
+try:
+gpu["temperature_c"] = round(int(temp) / 1000, 1)
+except Exception:
+pass
+gpus.append(gpu)
+
+lspci = self._run("lspci 2>/dev/null | grep -iE 'vga|3d|display'")
+if lspci and not gpus:
+for line in lspci.split("\n"):
+if line.strip():
+gpus.append({"lspci": line.strip()})
+self.data["gpu"] = gpus
+
+def collect_memory(self):
+mem = {}
+meminfo = self._read("/proc/meminfo")
+if meminfo:
+for line in meminfo.split("\n"):
+parts = line.split(":")
+if len(parts) == 2:
+key = parts[0].strip()
+val = parts[1].strip().split()[0]
+try:
+mem[key] = int(val)
+except ValueError:
+pass
+if "MemTotal" in mem:
+mem["total_gb"] = round(mem["MemTotal"] / 1024 / 1024, 2)
+if "MemAvailable" in mem:
+mem["available_gb"] = round(mem["MemAvailable"] / 1024 / 1024, 2)
+if mem.get("MemTotal"):
+mem["usage_percent"] = round(
+(1 - mem["MemAvailable"] / mem["MemTotal"]) * 100, 2
+)
+self.data["memory"] = mem
+
+def collect_disks(self):
+disks = []
+for blk in Path("/sys/block").glob("*"):
+name = blk.name
+if name.startswith(("loop", "ram", "dm-")):
+continue
+disk = {"name": name}
+size = self._read(str(blk / "size"))
+if size:
+try:
+disk["size_gb"] = round(int(size) * 512 / (1024**3), 2)
+except Exception:
+pass
+disk["model"] = self._read(str(blk / "device/model"))
+disk["rotational"] = self._read(str(blk / "queue/rotational"))
+disks.append(disk)
+self.data["disks"] = disks
+
+df = self._run("df -h 2>/dev/null | tail -n +2")
+if df:
+for line in df.split("\n"):
+parts = line.split()
+if len(parts) >= 6:
+self.data["disk_usage"].append({
+"filesystem": parts[0],
+"size": parts[1],
+"used": parts[2],
+"avail": parts[3],
+"use_pct": parts[4],
+"mount": parts[5],
+})
+
+def collect_thermal(self):
+for tz in Path("/sys/class/thermal").glob("thermal_zone*"):
+z = {"name": tz.name}
+z["type"] = self._read(str(tz / "type"))
+temp = self._read(str(tz / "temp"))
+if temp:
+try:
+z["temp_c"] = round(int(temp) / 1000, 1)
+except Exception:
+pass
+self.data["thermal"]["zones"].append(z)
+for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+h = {"name": self._read(str(hw / "name"))}
+temps = []
+for t in hw.glob("temp*_input"):
+val = self._read(str(t))
+if val:
+try:
+temps.append(round(int(val) / 1000, 1))
+except Exception:
+pass
+h["temps"] = temps
+self.data["thermal"]["hwmon"].append(h)
+
+def collect_all(self):
+self.collect_system()
+self.collect_cpu()
+self.collect_gpu()
+self.collect_memory()
+self.collect_disks()
+self.collect_thermal()
+return self.data
+
+def save(self, path):
+Path(path).write_text(json.dumps(self.data, indent=2, ensure_ascii=False))
+return path
+
+
+def main():
+smi = SMI()
+smi.collect_all()
+if len(sys.argv) > 1 and sys.argv[1] == "--json":
+print(json.dumps(smi.data, indent=2, ensure_ascii=False))
+else:
+print(f"Host: {smi.data['host']}")
+print(f"CPU: {smi.data['cpu'].get('info', {}).get('model', 'N/A')}")
+print(f"Cores: {smi.data['cpu'].get('info', {}).get('cores', 'N/A')}")
+print(f"Usage: {smi.data['cpu'].get('usage_percent', 0)}%")
+print(f"RAM: {smi.data['memory'].get('total_gb', 'N/A')} GB")
+print(f"GPU: {len(smi.data['gpu'])}")
+print(f"Disks: {len(smi.data['disks'])}")
+
+
+if __name__ == "__main__":
+main()
+PYEOF
+log OK " → smi_core.py"
+}
+
+write_cpp_engine() {
+local file="$SRC/smi_engine.cpp"
+cat > "$file" << 'CPPEOF'
+// Nexus SMI — C++ Engine
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <filesystem>
+#include <mutex>
+#include <iomanip>
+
+namespace fs = std::filesystem;
+
+class SMIEngine {
+private:
+std::map<std::string, std::string> data_;
+std::mutex mutex_;
+
+std::string read_file(const std::string& path) {
+std::ifstream f(path);
+if (!f.is_open()) return "";
+std::stringstream ss;
+ss << f.rdbuf();
+std::string s = ss.str();
+while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+return s;
+}
+
+std::vector<std::string> read_lines(const std::string& path) {
+std::vector<std::string> lines;
+std::ifstream f(path);
+std::string line;
+while (std::getline(f, line)) {
+if (!line.empty()) lines.push_back(line);
+}
+return lines;
+}
+
+public:
+void collect_cpu() {
+std::lock_guard<std::mutex> lock(mutex_);
+auto lines = read_lines("/proc/cpuinfo");
+for (const auto& line : lines) {
+if (line.find("model name") != std::string::npos) {
+auto pos = line.find(':');
+if (pos != std::string::npos) {
+data_["cpu_model"] = line.substr(pos + 2);
+break;
+}
+}
+}
+int cores = 0;
+for (const auto& line : lines) {
+if (line.find("processor") != std::string::npos) cores++;
+}
+data_["cpu_cores"] = std::to_string(cores);
+
+std::string load = read_file("/proc/loadavg");
+if (!load.empty()) data_["cpu_loadavg"] = load;
+
+auto stat_lines = read_lines("/proc/stat");
+for (const auto& line : stat_lines) {
+if (line.size() > 4 && line.substr(0, 4) == "cpu ") {
+std::istringstream iss(line);
+std::string label;
+long user, nice, sys, idle, iowait, irq, softirq;
+iss >> label >> user >> nice >> sys >> idle >> iowait >> irq >> softirq;
+long total = user + nice + sys + idle + iowait + irq + softirq;
+long used = total - idle;
+double pct = total > 0 ? (100.0 * used / total) : 0.0;
+std::stringstream ss;
+ss << std::fixed << std::setprecision(2) << pct;
+data_["cpu_usage_percent"] = ss.str();
+break;
+}
+}
+}
+
+void collect_memory() {
+std::lock_guard<std::mutex> lock(mutex_);
+auto lines = read_lines("/proc/meminfo");
+long total_kb = 0, avail_kb = 0;
+for (const auto& line : lines) {
+std::istringstream iss(line);
+std::string key, unit;
+long val;
+iss >> key >> val >> unit;
+if (key == "MemTotal:") total_kb = val;
+if (key == "MemAvailable:") avail_kb = val;
+}
+if (total_kb > 0) {
+std::stringstream ss;
+ss << std::fixed << std::setprecision(2) << (total_kb / 1024.0 / 1024.0);
+data_["mem_total_gb"] = ss.str();
+ss.str("");
+ss << std::fixed << std::setprecision(2) << (avail_kb / 1024.0 / 1024.0);
+data_["mem_avail_gb"] = ss.str();
+ss.str("");
+ss << std::fixed << std::setprecision(2)
+<< (100.0 * (1.0 - (double)avail_kb / total_kb));
+data_["mem_usage_percent"] = ss.str();
+}
+}
+
+void collect_gpus() {
+std::lock_guard<std::mutex> lock(mutex_);
+int count = 0;
+std::string drm_path = "/sys/class/drm";
+if (fs::exists(drm_path)) {
+for (const auto& entry : fs::directory_iterator(drm_path)) {
+std::string name = entry.path().filename().string();
+if (name.substr(0, 4) == "card" && name.find("-") == std::string::npos) {
+count++;
+std::string vendor_file = entry.path().string() + "/device/vendor";
+std::string vendor = read_file(vendor_file);
+std::string vendor_name = "Unknown";
+if (vendor == "0x10de") vendor_name = "NVIDIA";
+else if (vendor == "0x1002") vendor_name = "AMD";
+else if (vendor == "0x8086") vendor_name = "Intel";
+data_["gpu_" + std::to_string(count) + "_vendor"] = vendor_name;
+}
+}
+}
+data_["gpu_count"] = std::to_string(count);
+}
+
+void collect_disks() {
+std::lock_guard<std::mutex> lock(mutex_);
+int count = 0;
+std::string blk = "/sys/block";
+if (fs::exists(blk)) {
+for (const auto& entry : fs::directory_iterator(blk)) {
+std::string name = entry.path().filename().string();
+if (name.substr(0, 4) == "loop" || name.substr(0, 3) == "ram") continue;
+count++;
+std::string size = read_file(entry.path().string() + "/size");
+if (!size.empty()) {
+try {
+long sectors = std::stol(size);
+std::stringstream ss;
+ss << std::fixed << std::setprecision(2)
+<< (sectors * 512.0 / 1024 / 1024 / 1024);
+data_["disk_" + std::to_string(count) + "_size_gb"] = ss.str();
+} catch (...) {}
+}
+}
+}
+data_["disk_count"] = std::to_string(count);
+}
+
+void collect_thermal() {
+std::lock_guard<std::mutex> lock(mutex_);
+int count = 0;
+std::string tp = "/sys/class/thermal";
+if (fs::exists(tp)) {
+for (const auto& entry : fs::directory_iterator(tp)) {
+std::string name = entry.path().filename().string();
+if (name.substr(0, 12) == "thermal_zone") {
+count++;
+std::string temp = read_file(entry.path().string() + "/temp");
+if (!temp.empty()) {
+try {
+double t = std::stol(temp) / 1000.0;
+std::stringstream ss;
+ss << std::fixed << std::setprecision(1) << t;
+data_["thermal_zone_" + std::to_string(count) + "_c"] = ss.str();
+} catch (...) {}
+}
+}
+}
+}
+data_["thermal_zone_count"] = std::to_string(count);
+}
+
+void print_summary() {
+std::lock_guard<std::mutex> lock(mutex_);
+std::cout << "=== NEXUS SMI (C++) ===" << std::endl;
+std::cout << "CPU: " << data_["cpu_model"] << std::endl;
+std::cout << "Cores: " << data_["cpu_cores"] << std::endl;
+std::cout << "CPU usage: " << data_["cpu_usage_percent"] << "%" << std::endl;
+std::cout << "RAM total: " << data_["mem_total_gb"] << " GB" << std::endl;
+std::cout << "RAM usage: " << data_["mem_usage_percent"] << "%" << std::endl;
+std::cout << "GPU count: " << data_["gpu_count"] << std::endl;
+std::cout << "Disk count: " << data_["disk_count"] << std::endl;
+}
+
+void print_json() {
+std::lock_guard<std::mutex> lock(mutex_);
+std::cout << "{";
+bool first = true;
+for (const auto& kv : data_) {
+if (!first) std::cout << ",";
+std::cout << "\n \"" << kv.first << "\": \"" << kv.second << "\"";
+first = false;
+}
+std::cout << "\n}" << std::endl;
+}
+};
+
+int main(int argc, char** argv) {
+SMIEngine smi;
+smi.collect_cpu();
+smi.collect_memory();
+smi.collect_gpus();
+smi.collect_disks();
+smi.collect_thermal();
+
+if (argc > 1 && std::string(argv[1]) == "--json") {
+smi.print_json();
+} else {
+smi.print_summary();
+}
+return 0;
+}
+CPPEOF
+log OK " → smi_engine.cpp"
+}
+
+write_rust_probe() {
+local file="$SRC/smi_probe.rs"
+cat > "$file" << 'RUSTEOF'
+// Nexus SMI — Rust Probe
+use std::fs;
+use std::collections::HashMap;
+use std::path::Path;
+
+pub struct SMIProbe {
+data: HashMap<String, String>,
+}
+
+impl SMIProbe {
+pub fn new() -> Self {
+Self { data: HashMap::new() }
+}
+
+fn read(&self, path: &str) -> Option<String> {
+fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+pub fn collect_cpu(&mut self) {
+if let Some(content) = self.read("/proc/cpuinfo") {
+for line in content.lines() {
+if line.starts_with("model name") {
+if let Some(val) = line.split(':').nth(1) {
+self.data.insert("cpu_model".into(), val.trim().into());
+break;
+}
+}
+}
+let cores = content.matches("processor\t:").count();
+self.data.insert("cpu_cores".into(), cores.to_string());
+}
+if let Some(load) = self.read("/proc/loadavg") {
+self.data.insert("loadavg".into(), load);
+}
+}
+
+pub fn collect_memory(&mut self) {
+if let Some(content) = self.read("/proc/meminfo") {
+let mut total = 0u64;
+let mut avail = 0u64;
+for line in content.lines() {
+let parts: Vec<&str> = line.split_whitespace().collect();
+if parts.len() >= 2 {
+if parts[0] == "MemTotal:" {
+total = parts[1].parse().unwrap_or(0);
+} else if parts[0] == "MemAvailable:" {
+avail = parts[1].parse().unwrap_or(0);
+}
+}
+}
+if total > 0 {
+self.data.insert("mem_total_gb".into(),
+format!("{:.2}", total as f64 / 1024.0 / 1024.0));
+self.data.insert("mem_avail_gb".into(),
+format!("{:.2}", avail as f64 / 1024.0 / 1024.0));
+self.data.insert("mem_used_pct".into(),
+format!("{:.2}", 100.0 * (1.0 - avail as f64 / total as f64)));
+}
+}
+}
+
+pub fn collect_gpus(&mut self) {
+let drm = Path::new("/sys/class/drm");
+let mut count = 0;
+if drm.exists() {
+if let Ok(entries) = fs::read_dir(drm) {
+for entry in entries.flatten() {
+let name = entry.file_name().to_string_lossy().to_string();
+if name.starts_with("card") && !name.contains('-') {
+count += 1;
+let vendor_path = entry.path().join("device/vendor");
+if let Ok(vendor) = fs::read_to_string(&vendor_path) {
+let v = vendor.trim();
+let vn = match v {
+"0x10de" => "NVIDIA",
+"0x1002" => "AMD",
+"0x8086" => "Intel",
+_ => "Unknown",
+};
+self.data.insert(format!("gpu_{}_vendor", count), vn.into());
+}
+}
+}
+}
+}
+self.data.insert("gpu_count".into(), count.to_string());
+}
+
+pub fn collect_disks(&mut self) {
+let blk = Path::new("/sys/block");
+let mut count = 0;
+if blk.exists() {
+if let Ok(entries) = fs::read_dir(blk) {
+for entry in entries.flatten() {
+let name = entry.file_name().to_string_lossy().to_string();
+if name.starts_with("loop") || name.starts_with("ram") { continue; }
+count += 1;
+}
+}
+}
+self.data.insert("disk_count".into(), count.to_string());
+}
+
+pub fn collect_thermal(&mut self) {
+let tp = Path::new("/sys/class/thermal");
+let mut count = 0;
+if tp.exists() {
+if let Ok(entries) = fs::read_dir(tp) {
+for entry in entries.flatten() {
+let name = entry.file_name().to_string_lossy().to_string();
+if name.starts_with("thermal_zone") {
+count += 1;
+}
+}
+}
+}
+self.data.insert("thermal_zone_count".into(), count.to_string());
+}
+
+pub fn collect_all(&mut self) {
+self.collect_cpu();
+self.collect_memory();
+self.collect_gpus();
+self.collect_disks();
+self.collect_thermal();
+}
+
+pub fn print_summary(&self) {
+println!("=== NEXUS SMI (Rust) ===");
+for k in &["cpu_model", "cpu_cores", "loadavg",
+"mem_total_gb", "mem_used_pct",
+"gpu_count", "disk_count", "thermal_zone_count"] {
+if let Some(v) = self.data.get(*k) {
+println!("{}: {}", k, v);
+}
+}
+}
+
+pub fn print_json(&self) {
+print!("{{");
+let mut first = true;
+for (k, v) in &self.data {
+if !first { print!(","); }
+print!("\n \"{}\": \"{}\"", k, v);
+first = false;
+}
+println!("\n}}");
+}
+}
+
+fn main() {
+let mut probe = SMIProbe::new();
+probe.collect_all();
+let args: Vec<String> = std::env::args().collect();
+if args.len() > 1 && args[1] == "--json" {
+probe.print_json();
+} else {
+probe.print_summary();
+}
+}
+RUSTEOF
+log OK " → smi_probe.rs"
+}
+
+write_cuda_probe() {
+local file="$SRC/cuda_probe.cu"
+cat > "$file" << 'CUDAEOF'
+// Nexus SMI — CUDA Probe
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+int main() {
+int count = 0;
+cudaError_t err = cudaGetDeviceCount(&count);
+if (err != cudaSuccess) {
+printf("CUDA: non disponible\n");
+return 0;
+}
+printf("CUDA devices: %d\n", count);
+for (int i = 0; i < count; i++) {
+cudaDeviceProp prop;
+if (cudaGetDeviceProperties(&prop, i) == cudaSuccess) {
+printf(" [%d] %s\n", i, prop.name);
+printf(" Compute: %d.%d\n", prop.major, prop.minor);
+printf(" VRAM: %.2f GB\n", prop.totalGlobalMem / 1073741824.0);
+}
+}
+return 0;
+}
+CUDAEOF
+log OK " → cuda_probe.cu"
+}
+
+generate_sources() {
+section "[1] GÉNÉRATION DES SOURCES"
+write_jax_analyzer
+write_python_smi_core
+write_cpp_engine
+write_rust_probe
+write_cuda_probe
+echo ""
+log OK "5 fichiers générés"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# [2] BUILD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+build_all() {
+section "[2] BUILD"
+
+if command -v g++ >/dev/null 2>&1; then
+if g++ -O3 -std=c++17 -pthread "$SRC/smi_engine.cpp" -o "$BUILD/smi_cpp" 2>"$LOGS/cpp.log"; then
+log OK "smi_cpp (C++)"
+else
+log WARN "C++ échec (voir $LOGS/cpp.log)"
+fi
+else
+log WARN "g++ absent"
+fi
+
+if command -v rustc >/dev/null 2>&1; then
+if rustc -O "$SRC/smi_probe.rs" -o "$BUILD/smi_rust" 2>"$LOGS/rust.log"; then
+log OK "smi_rust (Rust)"
+else
+log WARN "Rust échec"
+fi
+else
+log WARN "rustc absent"
+fi
+
+if command -v nvcc >/dev/null 2>&1; then
+if nvcc -O3 "$SRC/cuda_probe.cu" -o "$BUILD/smi_cuda" 2>"$LOGS/cuda.log"; then
+log OK "smi_cuda (CUDA)"
+else
+log WARN "CUDA échec"
+fi
+else
+log INFO "CUDA absent (normal si pas de GPU NVIDIA)"
+fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# [3] COLLECTE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+collect_smi() {
+section "[3] COLLECTE SMI"
+
+if command -v python3 >/dev/null 2>&1; then
+python3 "$SRC/smi_core.py" --json > "$DATA/smi.json" 2>/dev/null
+[ -s "$DATA/smi.json" ] && log OK "smi.json ($(wc -c < "$DATA/smi.json") octets)"
+fi
+
+[ -x "$BUILD/smi_cpp" ] && "$BUILD/smi_cpp" --json > "$DATA/smi_cpp.json" 2>/dev/null && log OK "smi_cpp.json"
+[ -x "$BUILD/smi_rust" ] && "$BUILD/smi_rust" --json > "$DATA/smi_rust.json" 2>/dev/null && log OK "smi_rust.json"
+[ -x "$BUILD/smi_cuda" ] && "$BUILD/smi_cuda" > "$DATA/smi_cuda.txt" 2>/dev/null && log OK "smi_cuda.txt"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# [4] AFFICHAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+show_smi() {
+section "[4] NEXUS SMI"
+
+if [ ! -f "$DATA/smi.json" ]; then
+log WARN "Aucune donnée. Lance collecte (3) d'abord."
+return
+fi
+
+python3 - "$DATA/smi.json" << 'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+
+print("+" + "-" * 77 + "+")
+print(f"| NEXUS-SMI {d.get('host', '?')[:50]:<50} |")
+print("+" + "-" * 77 + "+")
+
+cpu = d.get("cpu", {})
+info = cpu.get("info", {})
+print(f"| CPU: {info.get('model', 'N/A')[:40]:<40} | Cores: {info.get('cores', '?'):<4} |")
+print(f"| Usage: {cpu.get('usage_percent', 0):<6}% | Load: {cpu.get('loadavg', 'N/A')[:30]:<30} |")
+
+mem = d.get("memory", {})
+print(f"| RAM: {mem.get('total_gb', '?'):<6} GB | Free: {mem.get('available_gb', '?'):<6} GB | Usage: {mem.get('usage_percent', 0):<5}% |")
+
+gpus = d.get("gpu", [])
+print(f"| GPUs: {len(gpus)}")
+for i, g in enumerate(gpus[:4]):
+vendor = g.get("vendor", "?")
+name = g.get("name", "?")
+vram = g.get("vram_total_gb", "?")
+print(f"| [{i}] {vendor} {name} — VRAM: {vram} GB")
+
+disks = d.get("disks", [])
+print(f"| Disks: {len(disks)}")
+for disk in disks[:4]:
+print(f"| {disk.get('name', '?'):<15} {disk.get('size_gb', '?'):<10} GB ({disk.get('model', '?')[:30]})")
+
+zones = d.get("thermal", {}).get("zones", [])
+if zones:
+print(f"| Temps: ", end="")
+for z in zones[:5]:
+print(f"{z.get('name', '?')}={z.get('temp_c', '?')}°C ", end="")
+print()
+
+print("+" + "-" * 77 + "+")
+PYEOF
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# [5] ANALYSE JAX
+# ═══════════════════════════════════════════════════════════════════════════════
+
+run_jax() {
+section "[5] ANALYSE JAX"
+if command -v python3 >/dev/null 2>&1; then
+python3 "$SRC/jax_analyzer.py"
+fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# [6] 10 CONFIGURATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+generate_configs() {
+section "[6] GÉNÉRATION 10 CONFIGURATIONS"
+
+# Config 1 : Monitoring temps réel
+cat > "$CONF/01_realtime.json" << 'EOJ'
+{
+"name": "Realtime Monitoring",
+"interval_sec": 1,
+"collect": ["cpu", "memory", "gpu", "thermal"],
+"export": "json",
+"log_level": "info"
+}
+EOJ
+log OK "01_realtime.json"
+
+# Config 2 : Deep scan
+cat > "$CONF/02_deep_scan.json" << 'EOJ'
+{
+"name": "Deep Scan",
+"interval_sec": 60,
+"collect": ["cpu", "memory", "gpu", "disks", "network", "thermal", "pci", "usb"],
+"export": "json+csv",
+"log_level": "debug"
+}
+EOJ
+log OK "02_deep_scan.json"
+
+# Config 3 : Performance profiling
+cat > "$CONF/03_perf_profile.json" << 'EOJ'
+{
+"name": "Performance Profile",
+"interval_sec": 5,
+"collect": ["cpu", "memory", "gpu"],
+"metrics": ["usage", "latency", "throughput"],
+"analysis": "jax",
+"export": "json"
+}
+EOJ
+log OK "03_perf_profile.json"
+
+# Config 4 : Thermal watch
+cat > "$CONF/04_thermal.json" << 'EOJ'
+{
+"name": "Thermal Watch",
+"interval_sec": 2,
+"collect": ["thermal", "power"],
+"alert_threshold_c": 80,
+"export": "json"
+}
+EOJ
+log OK "04_thermal.json"
+
+# Config 5 : GPU focus
+cat > "$CONF/05_gpu_focus.json" << 'EOJ'
+{
+"name": "GPU Focus",
+"interval_sec": 1,
+"collect": ["gpu"],
+"include_cuda": true,
+"export": "json"
+}
+EOJ
+log OK "05_gpu_focus.json"
+
+# Config 6 : CI/CD
+cat > "$CONF/06_ci_cd.json" << 'EOJ'
+{
+"name": "CI/CD Integration",
+"interval_sec": 0,
+"collect": ["cpu", "memory", "disks"],
+"export": "json",
+"exit_on_high": true,
+"threshold_cpu_pct": 90
+}
+EOJ
+log OK "06_ci_cd.json"
+
+# Config 7 : Benchmarking
+cat > "$CONF/07_benchmark.json" << 'EOJ'
+{
+"name": "Benchmark",
+"duration_sec": 300,
+"collect": ["cpu", "memory", "gpu", "disks"],
+"statistics": ["avg", "min", "max", "p95", "p99"],
+"export": "json+csv"
+}
+EOJ
+log OK "07_benchmark.json"
+
+# Config 8 : Alerting
+cat > "$CONF/08_alerting.json" << 'EOJ'
+{
+"name": "Alerting",
+"interval_sec": 10,
+"collect": ["cpu", "memory", "thermal"],
+"alerts": {
+"cpu_high": 85,
+"mem_high": 90,
+"temp_high": 80
+},
+"export": "json"
+}
+EOJ
+log OK "08_alerting.json"
+
+# Config 9 : Archive
+cat > "$CONF/09_archive.json" << 'EOJ'
+{
+"name": "Archive",
+"interval_sec": 3600,
+"collect": ["cpu", "memory", "gpu", "disks", "thermal"],
+"rotate_after_days": 30,
+"compress": true,
+"export": "json"
+}
+EOJ
+log OK "09_archive.json"
+
+# Config 10 : Machine Learning
+cat > "$CONF/10_ml_analysis.json" << 'EOJ'
+{
+"name": "ML Analysis",
+"interval_sec": 60,
+"collect": ["cpu", "memory", "gpu", "disks"],
+"analysis": "jax",
+"predict_anomalies": true,
+"window_size": 100,
+"export": "json"
+}
+EOJ
+log OK "10_ml_analysis.json"
+
+echo ""
+log OK "10 configurations générées dans $CONF"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# [7] 4 TESTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+test_1_python_syntax() {
+section "TEST 1 — SYNTAXE PYTHON"
+local ok=0
+for f in "$SRC/smi_core.py" "$SRC/jax_analyzer.py"; do
+if python3 -m py_compile "$f" 2>"$LOGS/test_py_$(basename "$f").log"; then
+log TEST "✅ $f : OK"
+ok=$((ok+1))
+else
+log TEST "❌ $f : ERREUR"
+cat "$LOGS/test_py_$(basename "$f").log"
+fi
+done
+[ $ok -eq 2 ] && return 0 || return 1
+}
+
+test_2_collecte() {
+section "TEST 2 — COLLECTE DONNÉES"
+python3 "$SRC/smi_core.py" --json > "$TESTS/test_collect.json" 2>/dev/null
+if [ -s "$TESTS/test_collect.json" ]; then
+local size
+size=$(wc -c < "$TESTS/test_collect.json")
+log TEST "✅ Collecte OK : $size octets"
+# Vérifier JSON valide
+if python3 -c "import json; json.load(open('$TESTS/test_collect.json'))" 2>/dev/null; then
+log TEST "✅ JSON valide"
+return 0
+else
+log TEST "❌ JSON invalide"
+return 1
+fi
+else
+log TEST "❌ Collecte vide"
+return 1
+fi
+}
+
+test_3_cpp_rust() {
+section "TEST 3 — BINAIRES C++/RUST"
+local ok=0
+[ -x "$BUILD/smi_cpp" ] && { log TEST "✅ smi_cpp existe"; ok=$((ok+1)); }
+[ -x "$BUILD/smi_rust" ] && { log TEST "✅ smi_rust existe"; ok=$((ok+1)); }
+
+if [ -x "$BUILD/smi_cpp" ]; then
+"$BUILD/smi_cpp" --json > /dev/null 2>&1 && log TEST "✅ smi_cpp exécute" || log TEST "❌ smi_cpp échoue"
+fi
+if [ -x "$BUILD/smi_rust" ]; then
+"$BUILD/smi_rust" --json > /dev/null 2>&1 && log TEST "✅ smi_rust exécute" || log TEST "❌ smi_rust échoue"
+fi
+
+[ $ok -ge 1 ] && return 0 || return 1
+}
+
+test_4_jax_analysis() {
+section "TEST 4 — ANALYSE JAX"
+local out
+out=$(python3 "$SRC/jax_analyzer.py" 2>&1)
+local exit_code=$?
+
+if [ $exit_code -eq 0 ]; then
+echo "$out" | head -20
+log TEST "✅ JAX analyzer fonctionne"
+return 0
+else
+log TEST "❌ JAX analyzer échoue"
+echo "$out"
+return 1
+fi
+}
+
+run_all_tests() {
+section "[7] TESTS COMPLETS"
+
+local passed=0
+local total=4
+
+test_1_python_syntax && passed=$((passed+1))
+test_2_collecte && passed=$((passed+1))
+test_3_cpp_rust && passed=$((passed+1))
+test_4_jax_analysis && passed=$((passed+1))
+
+echo ""
+echo -e "${C_BOLD}═══ RÉSULTAT TESTS ═══${C_RESET}"
+echo -e "${C_BOLD}$passed/$total tests passés${C_RESET}"
+
+[ $passed -eq $total ] && return 0 || return 1
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# [8] PIPELINE COMPLET
+# ═══════════════════════════════════════════════════════════════════════════════
+
+run_full_pipeline() {
+section "PIPELINE COMPLET"
+generate_sources
+build_all
+generate_configs
+collect_smi
+show_smi
+run_jax
+run_all_tests
+section "FIN PIPELINE"
+log OK "Runtime : $ROOT"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MENU
+# ═══════════════════════════════════════════════════════════════════════════════
+
+show_menu() {
+clear 2>/dev/null || true
+echo ""
+echo -e "${C_MAGENTA}╔══════════════════════════════════════════════════════════════════════╗${C_RESET}"
+echo -e "${C_MAGENTA}║${C_RESET} ${C_BOLD}⚡ NEXUS SMI OMEGA — v${VERSION}${C_RESET} ${C_MAGENTA}║${C_RESET}"
+echo -e "${C_MAGENTA}║${C_RESET} ${C_DIM}Sans NVIDIA · 10 configs · 4 tests · Multi-langage${C_RESET} ${C_MAGENTA}║${C_RESET}"
+echo -e "${C_MAGENTA}╚══════════════════════════════════════════════════════════════════════╝${C_RESET}"
+echo ""
+echo " [1] Générer sources (Python/C++/Rust/JAX/CUDA)"
+echo " [2] Build binaires (C++/Rust/CUDA)"
+echo " [3] Collecter infos système"
+echo " [4] Afficher tableau SMI"
+echo " [5] Analyse JAX"
+echo " [6] Générer 10 configurations"
+echo " [7] Lancer les 4 tests"
+echo " [8] Pipeline complet (1→7)"
+echo " [9] Voir data JSON"
+echo " [10] Voir configs"
+echo " [11] Voir logs"
+echo " [12] Quitter"
+echo ""
+}
+
+menu_loop() {
+while true; do
+show_menu
+read -r -p " ${C_GREEN}Choix [1-12]${C_RESET} > " choice
+case "$choice" in
+1|01) generate_sources ;;
+2|02) build_all ;;
+3|03) collect_smi ;;
+4|04) show_smi ;;
+5|05) run_jax ;;
+6|06) generate_configs ;;
+7|07) run_all_tests ;;
+8|08) run_full_pipeline ;;
+9|09) [ -f "$DATA/smi.json" ] && cat "$DATA/smi.json" || log WARN "Pas de données" ;;
+10) ls -la "$CONF" 2>/dev/null ;;
+11) tail -50 "$LOGS/smi.log" ;;
+12|q|quit|exit) log INFO "Fermeture"; exit 0 ;;
+*) log WARN "Choix invalide : $choice" ;;
+esac
+echo ""
+read -r -p " ${C_DIM}Entrée pour continuer...${C_RESET}" _
+done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+main() {
+init
+if [ $# -gt 0 ]; then
+case "$1" in
+--gen|gen) generate_sources ;;
+--build) build_all ;;
+--collect) collect_smi ;;
+--show) collect_smi; show_smi ;;
+--jax) run_jax ;;
+--configs) generate_configs ;;
+--tests) run_all_tests ;;
+--full) run_full_pipeline ;;
+--version|-v) echo "Nexus SMI Omega v$VERSION — $BUILD_DATE — $AUTHOR" ;;
+--help|-h)
+echo "Usage: $0 [OPTIONS]"
+echo " --gen Générer sources"
+echo " --build Compiler"
+echo " --collect Collecter"
+echo " --show Afficher tableau"
+echo " --jax Analyse JAX"
+echo " --configs Générer 10 configs"
+echo " --tests Lancer 4 tests"
+echo " --full Pipeline complet"
+echo " --version Version"
+;;
+*) menu_loop ;;
+esac
+else
+menu_loop
+fi
+}
+
+main "$@"
